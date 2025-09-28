@@ -996,7 +996,6 @@ bool MediaPlayCtrl::get_stream_url(std::string *url)
             size_t len = strnlen(str_data, size - 1);
             *url = std::string(str_data, len);
             ::munmap(addr, size);
-            url = nullptr;
         } else {
             BOOST_LOG_TRIVIAL(trace) << "Failed to mmap POSIX shared memory. Error: " << strerror(errno);
         }
