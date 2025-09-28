@@ -563,7 +563,9 @@ void MediaPlayCtrl::ToggleStream()
 #ifdef __APPLE__
                 // On macOS, provide additional troubleshooting information
                 auto res = MessageDialog(this->GetParent(), 
-                    _L("Virtual camera failed to start.\nThis may be due to macOS security restrictions or missing permissions.\n\nWould you like to see troubleshooting steps?"), 
+                    _L("Virtual camera failed to start.\n"
+                       "This may be due to macOS security restrictions or missing permissions.\n\n"
+                       "Would you like to see troubleshooting steps?"), 
                     _L("Virtual Camera Error"), wxYES_NO | wxICON_WARNING).ShowModal();
                 if (res == wxID_YES) {
                     show_macos_virtual_camera_troubleshooting(this->GetParent());
