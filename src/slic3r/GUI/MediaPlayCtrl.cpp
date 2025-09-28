@@ -24,6 +24,11 @@
 #endif
 #ifdef __APPLE__
 #include <ApplicationServices/ApplicationServices.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstring>
+#include "libslic3r/MacUtils.hpp"
 #endif
 
 #include <wx/clipbrd.h>
@@ -551,9 +556,23 @@ void MediaPlayCtrl::ToggleStream()
     std::string url;
     if (!get_stream_url(&url)) {
         // create stream pipeline
+        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::ToggleStream: No existing stream found, starting new stream service";
         bool need_install = false;
         if (!start_stream_service(&need_install)) {
-            if (!need_install) return;
+            if (!need_install) {
+#ifdef __APPLE__
+                // On macOS, provide additional troubleshooting information
+                auto res = MessageDialog(this->GetParent(), 
+                    _L("Virtual camera failed to start.\n"
+                       "This may be due to macOS security restrictions or missing permissions.\n\n"
+                       "Would you like to see troubleshooting steps?"), 
+                    _L("Virtual Camera Error"), wxYES_NO | wxICON_WARNING).ShowModal();
+                if (res == wxID_YES) {
+                    show_macos_virtual_camera_troubleshooting(this->GetParent());
+                }
+#endif
+                return;
+            }
             auto res = MessageDialog(this->GetParent(), _L("Virtual Camera Tools is required for this task!\nDo you want to install them?"), _L("Info"),
                                     wxOK | wxCANCEL).ShowModal();
             if (res == wxID_OK) {
@@ -584,6 +603,7 @@ void MediaPlayCtrl::ToggleStream()
         }
     }
     if (!url.empty() && wxGetApp().app_config->get("not_show_vcamera_stop_prev") != "1") {
+        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::ToggleStream: Found existing stream, prompting user";
         MessageDialog dlg(this->GetParent(), _L("Another virtual camera is running.\nBambu Studio supports only a single virtual camera.\nDo you want to stop this virtual camera?"), _L("Warning"),
                                  wxYES | wxCANCEL | wxICON_INFORMATION);
         dlg.show_dsa_button();
@@ -832,6 +852,7 @@ void MediaPlayCtrl::media_proc()
 
 bool MediaPlayCtrl::start_stream_service(bool *need_install)
 {
+    BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::start_stream_service: Starting virtual camera stream service";
 #ifdef __WIN32__
     auto tools_dir = boost::nowide::widen(data_dir())  + L"\\cameratools\\";
     auto file_source = tools_dir + L"bambu_source.exe";
@@ -879,8 +900,16 @@ bool MediaPlayCtrl::start_stream_service(bool *need_install)
 #else
         boost::filesystem::permissions(file_source, boost::filesystem::owner_exe | boost::filesystem::add_perms);
         boost::filesystem::permissions(file_ffmpeg, boost::filesystem::owner_exe | boost::filesystem::add_perms);
+#ifdef __APPLE__
+        // On macOS, especially macOS 15+, use POSIX shared memory for better compatibility
+        std::string use_posix_shm = "--use-posix-shm";
+        boost::process::child process_source(file_source, file_url2.data().AsInternal(), use_posix_shm, 
+                                             boost::process::start_dir(start_dir),
+                                             boost::process::std_out > intermediate, boost::process::limit_handles);
+#else
         boost::process::child process_source(file_source, file_url2.data().AsInternal(), boost::process::start_dir(start_dir),
                                              boost::process::std_out > intermediate, boost::process::limit_handles);
+#endif
         boost::process::child process_ffmpeg(file_ffmpeg, configss, boost::process::std_in < intermediate, boost::process::limit_handles);
 #endif
         process_source.detach();
@@ -909,6 +938,71 @@ bool MediaPlayCtrl::get_stream_url(std::string *url)
         }
     }
     CloseHandle(shm);
+#elif defined(__APPLE__)
+    // Use POSIX shared memory for better macOS compatibility, especially macOS 15+
+    const char* shm_name = "/bambu_stream_url";
+    int shm_fd = ::shm_open(shm_name, O_RDONLY, 0);
+    if (shm_fd == -1) {
+        BOOST_LOG_TRIVIAL(trace) << "Failed to open POSIX shared memory, trying System V fallback. Error: " << strerror(errno);
+        // Fallback to traditional System V shared memory for older versions
+        std::string file_url = data_dir() + "/cameratools/url.txt";
+        key_t key = ::ftok(file_url.c_str(), 1000);
+        int shm = ::shmget(key, 1024, 0);
+        if (shm == -1) {
+            BOOST_LOG_TRIVIAL(trace) << "Failed to get System V shared memory, trying file fallback. Error: " << strerror(errno);
+            // Final fallback: check if there's a file-based indicator
+            std::string status_file = data_dir() + "/cameratools/status.txt";
+            if (boost::filesystem::exists(status_file)) {
+                if (url) {
+                    std::string content;
+                    if (load_string_file(status_file, content) && !content.empty()) {
+                        *url = content;
+                        url = nullptr;
+                    }
+                }
+                return url == nullptr;
+            }
+            return false;
+        }
+        struct shmid_ds ds;
+        ::shmctl(shm, IPC_STAT, &ds);
+        if (ds.shm_nattch == 0) {
+            BOOST_LOG_TRIVIAL(trace) << "System V shared memory has no attachments";
+            return false;
+        }
+        if (url) {
+            char *addr = (char *) ::shmat(shm, nullptr, 0);
+            if (addr != (void*) -1) {
+                *url = addr;
+                ::shmdt(addr);
+                url = nullptr;
+            }
+        }
+        return url == nullptr;
+    }
+    
+    if (url) {
+        // Get the size of the shared memory object
+        struct stat sb;
+        if (::fstat(shm_fd, &sb) == -1) {
+            BOOST_LOG_TRIVIAL(trace) << "Failed to get POSIX shared memory size. Error: " << strerror(errno);
+            ::close(shm_fd);
+            return false;
+        }
+        
+        size_t size = sb.st_size > 0 ? sb.st_size : 1024;
+        void *addr = ::mmap(NULL, size, PROT_READ, MAP_SHARED, shm_fd, 0);
+        if (addr != MAP_FAILED) {
+            // Safely copy the string, ensuring null termination
+            char* str_data = (char*)addr;
+            size_t len = strnlen(str_data, size - 1);
+            *url = std::string(str_data, len);
+            ::munmap(addr, size);
+        } else {
+            BOOST_LOG_TRIVIAL(trace) << "Failed to mmap POSIX shared memory. Error: " << strerror(errno);
+        }
+    }
+    ::close(shm_fd);
 #else
     std::string file_url = data_dir() + "/cameratools/url.txt";
     key_t key = ::ftok(file_url.c_str(), 1000);
@@ -930,6 +1024,30 @@ bool MediaPlayCtrl::get_stream_url(std::string *url)
 #endif
     return url == nullptr;
 }
+
+#ifdef __APPLE__
+void MediaPlayCtrl::show_macos_virtual_camera_troubleshooting(wxWindow* parent)
+{
+    wxString message = _L("Virtual Camera Troubleshooting for macOS:\n\n");
+    message += _L("1. System Preferences → Security & Privacy → Privacy → Camera\n");
+    message += _L("   Make sure BambuStudio has camera access\n\n");
+    message += _L("2. System Preferences → Security & Privacy → Privacy → Screen Recording\n");
+    message += _L("   Make sure BambuStudio has screen recording access\n\n");
+    message += _L("3. If using macOS 15 or later:\n");
+    message += _L("   - The virtual camera uses enhanced compatibility mode\n");
+    message += _L("   - Try restarting BambuStudio\n");
+    message += _L("   - Check Console.app for error messages\n\n");
+    message += _L("4. For OBS Studio integration:\n");
+    message += _L("   - Add a new source → Video Capture Device\n");
+    message += _L("   - Select 'BambuStudio Virtual Camera' as the device\n\n");
+    message += _L("5. If the issue persists:\n");
+    message += _L("   - Try running BambuStudio with administrator privileges\n");
+    message += _L("   - Check if other camera applications are running\n");
+    message += _L("   - Restart your Mac to clear any system-level conflicts");
+    
+    MessageDialog(parent, message, _L("Virtual Camera Help"), wxOK | wxICON_INFORMATION).ShowModal();
+}
+#endif
 
 static int SecondsSinceLastInput()
 {
