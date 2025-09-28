@@ -556,9 +556,21 @@ void MediaPlayCtrl::ToggleStream()
     std::string url;
     if (!get_stream_url(&url)) {
         // create stream pipeline
+        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::ToggleStream: No existing stream found, starting new stream service";
         bool need_install = false;
         if (!start_stream_service(&need_install)) {
-            if (!need_install) return;
+            if (!need_install) {
+#ifdef __APPLE__
+                // On macOS, provide additional troubleshooting information
+                auto res = MessageDialog(this->GetParent(), 
+                    _L("Virtual camera failed to start.\nThis may be due to macOS security restrictions or missing permissions.\n\nWould you like to see troubleshooting steps?"), 
+                    _L("Virtual Camera Error"), wxYES_NO | wxICON_WARNING).ShowModal();
+                if (res == wxID_YES) {
+                    show_macos_virtual_camera_troubleshooting(this->GetParent());
+                }
+#endif
+                return;
+            }
             auto res = MessageDialog(this->GetParent(), _L("Virtual Camera Tools is required for this task!\nDo you want to install them?"), _L("Info"),
                                     wxOK | wxCANCEL).ShowModal();
             if (res == wxID_OK) {
@@ -589,6 +601,7 @@ void MediaPlayCtrl::ToggleStream()
         }
     }
     if (!url.empty() && wxGetApp().app_config->get("not_show_vcamera_stop_prev") != "1") {
+        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::ToggleStream: Found existing stream, prompting user";
         MessageDialog dlg(this->GetParent(), _L("Another virtual camera is running.\nBambu Studio supports only a single virtual camera.\nDo you want to stop this virtual camera?"), _L("Warning"),
                                  wxYES | wxCANCEL | wxICON_INFORMATION);
         dlg.show_dsa_button();
@@ -837,6 +850,7 @@ void MediaPlayCtrl::media_proc()
 
 bool MediaPlayCtrl::start_stream_service(bool *need_install)
 {
+    BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::start_stream_service: Starting virtual camera stream service";
 #ifdef __WIN32__
     auto tools_dir = boost::nowide::widen(data_dir())  + L"\\cameratools\\";
     auto file_source = tools_dir + L"bambu_source.exe";
@@ -1009,6 +1023,30 @@ bool MediaPlayCtrl::get_stream_url(std::string *url)
 #endif
     return url == nullptr;
 }
+
+#ifdef __APPLE__
+void MediaPlayCtrl::show_macos_virtual_camera_troubleshooting(wxWindow* parent)
+{
+    wxString message = _L("Virtual Camera Troubleshooting for macOS:\n\n");
+    message += _L("1. System Preferences → Security & Privacy → Privacy → Camera\n");
+    message += _L("   Make sure BambuStudio has camera access\n\n");
+    message += _L("2. System Preferences → Security & Privacy → Privacy → Screen Recording\n");
+    message += _L("   Make sure BambuStudio has screen recording access\n\n");
+    message += _L("3. If using macOS 15 or later:\n");
+    message += _L("   - The virtual camera uses enhanced compatibility mode\n");
+    message += _L("   - Try restarting BambuStudio\n");
+    message += _L("   - Check Console.app for error messages\n\n");
+    message += _L("4. For OBS Studio integration:\n");
+    message += _L("   - Add a new source → Video Capture Device\n");
+    message += _L("   - Select 'BambuStudio Virtual Camera' as the device\n\n");
+    message += _L("5. If the issue persists:\n");
+    message += _L("   - Try running BambuStudio with administrator privileges\n");
+    message += _L("   - Check if other camera applications are running\n");
+    message += _L("   - Restart your Mac to clear any system-level conflicts");
+    
+    MessageDialog(parent, message, _L("Virtual Camera Help"), wxOK | wxICON_INFORMATION).ShowModal();
+}
+#endif
 
 static int SecondsSinceLastInput()
 {

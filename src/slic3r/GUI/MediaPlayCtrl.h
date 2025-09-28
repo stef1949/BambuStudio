@@ -74,6 +74,10 @@ private:
 
     static bool get_stream_url(std::string *url = nullptr);
 
+#ifdef __APPLE__
+    static void show_macos_virtual_camera_troubleshooting(wxWindow* parent);
+#endif
+
 private:
     static constexpr wxMediaState MEDIASTATE_IDLE = (wxMediaState) 3;
     static constexpr wxMediaState MEDIASTATE_INITIALIZING = (wxMediaState) 4;
