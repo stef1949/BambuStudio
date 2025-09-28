@@ -24,6 +24,11 @@
 #endif
 #ifdef __APPLE__
 #include <ApplicationServices/ApplicationServices.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstring>
+#include "libslic3r/MacUtils.hpp"
 #endif
 
 #include <wx/clipbrd.h>
@@ -879,8 +884,16 @@ bool MediaPlayCtrl::start_stream_service(bool *need_install)
 #else
         boost::filesystem::permissions(file_source, boost::filesystem::owner_exe | boost::filesystem::add_perms);
         boost::filesystem::permissions(file_ffmpeg, boost::filesystem::owner_exe | boost::filesystem::add_perms);
+#ifdef __APPLE__
+        // On macOS, especially macOS 15+, use POSIX shared memory for better compatibility
+        std::string use_posix_shm = "--use-posix-shm";
+        boost::process::child process_source(file_source, file_url2.data().AsInternal(), use_posix_shm, 
+                                             boost::process::start_dir(start_dir),
+                                             boost::process::std_out > intermediate, boost::process::limit_handles);
+#else
         boost::process::child process_source(file_source, file_url2.data().AsInternal(), boost::process::start_dir(start_dir),
                                              boost::process::std_out > intermediate, boost::process::limit_handles);
+#endif
         boost::process::child process_ffmpeg(file_ffmpeg, configss, boost::process::std_in < intermediate, boost::process::limit_handles);
 #endif
         process_source.detach();
@@ -909,6 +922,72 @@ bool MediaPlayCtrl::get_stream_url(std::string *url)
         }
     }
     CloseHandle(shm);
+#elif defined(__APPLE__)
+    // Use POSIX shared memory for better macOS compatibility, especially macOS 15+
+    const char* shm_name = "/bambu_stream_url";
+    int shm_fd = ::shm_open(shm_name, O_RDONLY, 0);
+    if (shm_fd == -1) {
+        BOOST_LOG_TRIVIAL(trace) << "Failed to open POSIX shared memory, trying System V fallback. Error: " << strerror(errno);
+        // Fallback to traditional System V shared memory for older versions
+        std::string file_url = data_dir() + "/cameratools/url.txt";
+        key_t key = ::ftok(file_url.c_str(), 1000);
+        int shm = ::shmget(key, 1024, 0);
+        if (shm == -1) {
+            BOOST_LOG_TRIVIAL(trace) << "Failed to get System V shared memory, trying file fallback. Error: " << strerror(errno);
+            // Final fallback: check if there's a file-based indicator
+            std::string status_file = data_dir() + "/cameratools/status.txt";
+            if (boost::filesystem::exists(status_file)) {
+                if (url) {
+                    std::string content;
+                    if (load_string_file(status_file, content) && !content.empty()) {
+                        *url = content;
+                        url = nullptr;
+                    }
+                }
+                return url == nullptr;
+            }
+            return false;
+        }
+        struct shmid_ds ds;
+        ::shmctl(shm, IPC_STAT, &ds);
+        if (ds.shm_nattch == 0) {
+            BOOST_LOG_TRIVIAL(trace) << "System V shared memory has no attachments";
+            return false;
+        }
+        if (url) {
+            char *addr = (char *) ::shmat(shm, nullptr, 0);
+            if (addr != (void*) -1) {
+                *url = addr;
+                ::shmdt(addr);
+                url = nullptr;
+            }
+        }
+        return url == nullptr;
+    }
+    
+    if (url) {
+        // Get the size of the shared memory object
+        struct stat sb;
+        if (::fstat(shm_fd, &sb) == -1) {
+            BOOST_LOG_TRIVIAL(trace) << "Failed to get POSIX shared memory size. Error: " << strerror(errno);
+            ::close(shm_fd);
+            return false;
+        }
+        
+        size_t size = sb.st_size > 0 ? sb.st_size : 1024;
+        void *addr = ::mmap(NULL, size, PROT_READ, MAP_SHARED, shm_fd, 0);
+        if (addr != MAP_FAILED) {
+            // Safely copy the string, ensuring null termination
+            char* str_data = (char*)addr;
+            size_t len = strnlen(str_data, size - 1);
+            *url = std::string(str_data, len);
+            ::munmap(addr, size);
+            url = nullptr;
+        } else {
+            BOOST_LOG_TRIVIAL(trace) << "Failed to mmap POSIX shared memory. Error: " << strerror(errno);
+        }
+    }
+    ::close(shm_fd);
 #else
     std::string file_url = data_dir() + "/cameratools/url.txt";
     key_t key = ::ftok(file_url.c_str(), 1000);
