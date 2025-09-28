@@ -1,3 +1,4 @@
+name: Build Bambu (callable)
 on:
   workflow_call:
     inputs:
